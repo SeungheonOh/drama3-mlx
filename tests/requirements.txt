@@ -1,0 +1,13 @@
+# parity tests against fish-speech (fetched by tests/setup_reference.sh)
+-r ../tools/requirements.txt
+pytest
+torchaudio==2.8.0
+tokenizers==0.23.3
+safetensors
+soundfile
+scipy
+descript-audio-codec==1.0.0
+hydra-core
+omegaconf
+loguru
+einops

@@ -1,0 +1,19 @@
+# weights: download and convert locally (see README)
+/checkpoints/
+/mlx_model/
+
+# build and run artifacts
+/build/
+/out/
+/logs/
+/.venv/
+
+# fetched / generated inputs
+/tools/ucd/
+/tests/.ref/
+/tests/.cache/
+/tests/data/*.wav
+
+__pycache__/
+.pytest_cache/
+.DS_Store

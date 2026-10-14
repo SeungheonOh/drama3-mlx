@@ -1,0 +1,4 @@
+# tools/convert.py
+mlx==0.32.3
+numpy
+torch==2.8.0  # reads codec.pth
