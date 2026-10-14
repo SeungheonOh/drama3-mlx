@@ -141,8 +141,8 @@ static void load_tower_layer(WeightStore *ws, TowerLayer *t, const char *prefix)
   t->k_norm = weights_get(ws, "%s.block.attention.k_norm.weight", prefix);
   t->wqkv = weights_get(ws, "%s.block.attention.wqkv.weight", prefix);
   t->wo = weights_get(ws, "%s.block.attention.wo.weight", prefix);
-  t->w1 = weights_get(ws, "%s.block.feed_forward.w1.weight", prefix);
   t->w2 = weights_get(ws, "%s.block.feed_forward.w2.weight", prefix);
+  t->w1 = weights_get(ws, "%s.block.feed_forward.w1.weight", prefix);
   t->w3 = weights_get(ws, "%s.block.feed_forward.w3.weight", prefix);
 }
 
@@ -183,6 +183,18 @@ Model *model_load(const char *dir) {
   parse_config(dir, c);
   load_tokenizer(m, dir);
 
+  {
+    int32_t up[64] = {0}, down[64];
+    if (c->top_k > 64) die("config: top_k too large");
+    for (int i = 0; i < c->top_k; i++) down[i] = i;
+    size_t mark = arena_mark();
+    m->moe_lhs_up = own(m_astype(m_from_data(up, SH(1, c->top_k), MLX_INT32), MLX_UINT32));
+    m->moe_lhs_down = own(m_astype(m_from_data(down, SH(1, c->top_k), MLX_INT32), MLX_UINT32));
+    m_eval(m->moe_lhs_up);
+    m_eval(m->moe_lhs_down);
+    arena_release(mark);
+  }
+
   WeightStore *ws = m->weights = weights_open_index(dir);
   mlx_array *all = NULL;
   size_t n = 0, cap = 0;
@@ -220,8 +232,8 @@ Model *model_load(const char *dir) {
     GET(L->router, "layers.%d.mlp.gate.weight", i);
     GET(L->sh_gate, "layers.%d.mlp.shared_expert.gate_proj.weight", i);
     GET(L->sh_up, "layers.%d.mlp.shared_expert.up_proj.weight", i);
-    GET(L->sh_down, "layers.%d.mlp.shared_expert.down_proj.weight", i);
     GET(L->sh_expert_gate, "layers.%d.mlp.shared_expert_gate.weight", i);
+    GET(L->sh_down, "layers.%d.mlp.shared_expert.down_proj.weight", i);
     GET(L->gu_w, "layers.%d.mlp.experts.gate_up_proj.weight", i);
     GET(L->gu_s, "layers.%d.mlp.experts.gate_up_proj.scales", i);
     GET(L->gu_b, "layers.%d.mlp.experts.gate_up_proj.biases", i);
@@ -258,9 +270,14 @@ Model *model_load(const char *dir) {
     for (size_t k = 0; k < sizeof(ws_) / sizeof(ws_[0]); k++) push(&all, &n, &cap, ws_[k]);
   }
   double t0 = now_seconds();
-  for (size_t i = 0; i < n; i += 64) m_eval_many(all + i, n - i < 64 ? n - i : 64);
+  /* one evaluation of every weight reads the files faster than batches */
+  m_eval_many(all, n);
   log_info("loaded %zu tensors in %.1fs", n, now_seconds() - t0);
   free(all);
+  /* every weight has its own handle; the file maps are no longer needed */
+  weights_free(m->weights);
+  m->weights = NULL;
+  mlx_clear_cache();
   return m;
 }
 
@@ -276,13 +293,12 @@ void model_free(Model *m) {
   if (!m) return;
   for (int i = 0; i < m->cfg.n_layers; i++) {
     BackboneLayer *L = &m->layers[i];
-    mlx_array *fields[] = {&L->input_norm, &L->post_norm, &L->in_qkv, &L->in_z,
-                           &L->in_b, &L->in_a, &L->conv_w, &L->dt_bias, &L->a_log,
-                           &L->gdn_norm, &L->out_proj, &L->q_proj, &L->k_proj,
-                           &L->v_proj, &L->o_proj, &L->q_norm, &L->k_norm, &L->router,
-                           &L->sh_gate, &L->sh_up, &L->sh_down, &L->sh_expert_gate,
-                           &L->gu_w, &L->gu_s, &L->gu_b, &L->down_w, &L->down_s,
-                           &L->down_b};
+    mlx_array *fields[] = {&L->input_norm, &L->post_norm, &L->in_qkv, &L->in_z, &L->in_b,
+                           &L->in_a, &L->conv_w, &L->dt_bias, &L->a_log, &L->gdn_norm,
+                           &L->out_proj, &L->q_proj, &L->k_proj, &L->v_proj, &L->o_proj,
+                           &L->q_norm, &L->k_norm, &L->router, &L->sh_gate, &L->sh_up,
+                           &L->sh_expert_gate, &L->sh_down, &L->gu_w, &L->gu_s, &L->gu_b,
+                           &L->down_w, &L->down_s, &L->down_b};
     for (size_t k = 0; k < sizeof(fields) / sizeof(fields[0]); k++) release(fields[k]);
     release(&m->cache[i].k);
     release(&m->cache[i].v);
@@ -298,6 +314,15 @@ void model_free(Model *m) {
   release(&m->final_norm);
   release(&m->lm_head_audio);
   release(&m->codebook_embeddings);
+  release(&m->moe_lhs_up);
+  release(&m->moe_lhs_down);
+  Compiled *compiled[] = {&m->backbone_compiled.gdn,     &m->backbone_compiled.attn_pre,
+                          &m->backbone_compiled.attn_post, &m->backbone_compiled.attn,
+                          &m->tower_compiled.pre,          &m->tower_compiled.post,
+                          &m->tower_compiled.post_head,    &m->tower_compiled.layer,
+                          &m->tower_compiled.layer_head};
+  for (size_t i = 0; i < sizeof(compiled) / sizeof(compiled[0]); i++)
+    if (compiled[i]->ready) mlx_closure_free(compiled[i]->closure);
   weights_free(m->weights);
   tok_free(m->tok);
   free(m);

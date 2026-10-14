@@ -70,6 +70,22 @@ def test_decode_step_matches_fish_greedy(model):
     assert ours.tolist() == theirs.tolist()
 
 
+@pytest.mark.parametrize("V,top_k", [(4097, 30), (1024, 30), (4097, 5)])
+def test_sampler_kernel_matches_op_path_on_ties(monkeypatch, V, top_k):
+    """Logits tied across the k-th place: the fused sampler keeps the same tied
+    candidates as the op graph (the lowest ids, as a stable sort does), so a seed
+    gives the same ids on both paths and on every call."""
+    rng = np.random.default_rng(1)
+    logits = np.round(rng.standard_normal((8, V)) * 2).astype(np.float32)
+    for seed in range(40):
+        monkeypatch.delenv("D3_NO_FUSED_SAMPLER", raising=False)
+        fused = d3.sample(logits, 1.0, top_k, 2.0, seed)
+        again = d3.sample(logits, 1.0, top_k, 2.0, seed)
+        monkeypatch.setenv("D3_NO_FUSED_SAMPLER", "1")
+        ops = d3.sample(logits, 1.0, top_k, 2.0, seed)
+        assert fused.tolist() == again.tolist() == ops.tolist(), seed
+
+
 @pytest.mark.parametrize("temperature,top_k,top_p",
                          [(0.7, 30, 0.7), (1.0, 30, 0.9), (1.0, 5, 1.0), (0.3, 30, 0.95)])
 def test_sampler_distribution(temperature, top_k, top_p):

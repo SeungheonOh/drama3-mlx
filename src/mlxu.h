@@ -133,13 +133,29 @@ mlx_array m_argpartition(mlx_array a, int kth, int axis);
 mlx_array m_matmul(mlx_array a, mlx_array b);
 /* x @ w.T */
 mlx_array m_linear(mlx_array x, mlx_array w);
+/* silu(x wg^T) * (x wu^T). */
+mlx_array m_linear_silu_pair(mlx_array x, mlx_array wg, mlx_array wu);
 mlx_array m_gather_qmm(mlx_array x, mlx_array w, mlx_array scales, mlx_array biases,
                        mlx_array rhs_indices, int group_size, int bits, bool sorted);
+/* With explicit lhs indices (avoids MLX building an arange per call). */
+mlx_array m_gather_qmm_lhs(mlx_array x, mlx_array w, mlx_array scales, mlx_array biases,
+                           mlx_array lhs_indices, mlx_array rhs_indices, int group_size,
+                           int bits);
 
 /* ---- fast ---- */
 mlx_array m_rms_norm(mlx_array x, mlx_array weight, float eps);
+/* RMSNorm over the last axis in one kernel: fp32 math whatever x's dtype,
+ * times an fp32 weight (or none), written as out_dtype. Equals
+ * astype(rms_norm(astype(x, f32), w, eps), out_dtype). */
+mlx_array m_rms_norm_f32(mlx_array x, mlx_array weight_f32, float eps, mlx_dtype out_dtype);
+/* sum = a + b (in a's dtype, like m_add) and m_rms_norm_f32(sum, w, eps) in one
+ * kernel over rows of the last axis. */
+void m_add_rms_norm_f32(mlx_array a, mlx_array b, mlx_array weight_f32, float eps,
+                        mlx_array *sum, mlx_array *normed);
 mlx_array m_layer_norm(mlx_array x, mlx_array weight, mlx_array bias, float eps);
 mlx_array m_rope(mlx_array x, int dims, bool traditional, float base, int offset);
+/* RoPE with the position offset in an int32 scalar array (stays valid under compile). */
+mlx_array m_rope_dyn(mlx_array x, int dims, bool traditional, float base, mlx_array offset);
 mlx_array m_sdpa(mlx_array q, mlx_array k, mlx_array v, float scale,
                  const char *mask_mode, mlx_array mask);
 
@@ -151,6 +167,21 @@ mlx_array m_conv_transpose1d(mlx_array x, mlx_array w, int stride, int padding);
 /* ---- random ---- */
 void m_seed(uint64_t seed);
 mlx_array m_uniform(const int *shape, size_t n, mlx_dtype dtype);
+
+/* ---- compilation ----
+ * A Compiled wraps a pure function of arrays in mlx_compile: traced once per
+ * input shape, then replayed as fused kernels. Weights must be passed as inputs
+ * (captured arrays would be baked in as constants). D3_NO_COMPILE=1 runs the
+ * functions eagerly instead. */
+typedef void (*CompiledFn)(const mlx_array *in, mlx_array *out, const void *ctx);
+typedef struct {
+  CompiledFn fn;
+  const void *ctx;   /* constant configuration, shared by every call */
+  size_t n_out;
+  mlx_closure closure;
+  bool ready;
+} Compiled;
+void compiled_call(Compiled *c, const mlx_array *in, size_t n_in, mlx_array *out);
 
 /* ---- evaluation & host access ---- */
 void m_eval(mlx_array a);

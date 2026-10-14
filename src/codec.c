@@ -27,13 +27,23 @@
 static const int ENCODER_RATES[4] = {2, 4, 8, 8};
 static const int DECODER_RATES[4] = {8, 8, 4, 2};
 
+typedef struct {
+  int dilation;
+} UnitCtx;
+
 struct Codec {
-  WeightStore *ws;
+  /* every weight, converted once to dtype at load */
+  mlx_map_string_to_array weights;
   mlx_dtype dtype;
   int hop, frame_length;
   /* RoPE tables shared by all codec transformers: [max_len, 32] in bf16 values */
   mlx_array rope_cos, rope_sin;
   int rope_len;
+  /* compiled blocks: one fused elementwise kernel between convolutions */
+  struct {
+    Compiled snake, unit[3], convnext;
+    UnitCtx unit_ctx[3];
+  } compiled;
 };
 
 static mlx_array W(Codec *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -44,16 +54,40 @@ static mlx_array W(Codec *c, const char *fmt, ...) {
   va_start(args, fmt);
   vsnprintf(name, sizeof(name), fmt, args);
   va_end(args);
-  mlx_array w = weights_get(c->ws, "%s", name);
-  mlx_array r = m_astype(w, c->dtype);
-  mlx_array_free(w);
-  return r;
+  mlx_array w = mlx_array_new();
+  if (mlx_map_string_to_array_get(&w, c->weights, name) || !w.ctx) die("codec: missing %s", name);
+  return track(w);
 }
 
 Codec *codec_load(const char *path, mlx_dtype dtype) {
   mlxu_init();
   Codec *c = calloc(1, sizeof(Codec));
-  c->ws = weights_open_file(path);
+  FILE *probe = fopen(path, "rb");
+  if (!probe) die("cannot open %s (run tools/convert.py, or pass --model DIR)", path);
+  fclose(probe);
+  mlx_map_string_to_array raw = mlx_map_string_to_array_new();
+  mlx_map_string_to_string meta = mlx_map_string_to_string_new();
+  mlx_stream cpu = mlx_default_cpu_stream_new();
+  if (mlx_load_safetensors(&raw, &meta, path, cpu)) die("cannot load %s", path);
+  mlx_stream_free(cpu);
+  mlx_map_string_to_string_free(meta);
+  c->weights = mlx_map_string_to_array_new();
+  mlx_map_string_to_array_iterator it = mlx_map_string_to_array_iterator_new(raw);
+  const char *key;
+  mlx_array value = mlx_array_new();
+  mlx_array converted[1024];
+  size_t n = 0;
+  size_t mark = arena_mark();
+  while (mlx_map_string_to_array_iterator_next(&key, &value, it) == 0 && key) {
+    mlx_array a = m_astype(value, dtype);
+    mlx_map_string_to_array_insert(c->weights, key, a);
+    if (n < 1024) converted[n++] = a;
+  }
+  m_eval_many(converted, n);
+  arena_release(mark);
+  mlx_array_free(value);
+  mlx_map_string_to_array_iterator_free(it);
+  mlx_map_string_to_array_free(raw);
   c->dtype = dtype;
   c->hop = 1;
   for (int i = 0; i < 4; i++) c->hop *= ENCODER_RATES[i];
@@ -63,29 +97,33 @@ Codec *codec_load(const char *path, mlx_dtype dtype) {
 
 void codec_free(Codec *c) {
   if (!c) return;
+  Compiled *compiled[] = {&c->compiled.snake, &c->compiled.convnext, &c->compiled.unit[0],
+                          &c->compiled.unit[1], &c->compiled.unit[2]};
+  for (size_t i = 0; i < sizeof(compiled) / sizeof(compiled[0]); i++)
+    if (compiled[i]->ready) mlx_closure_free(compiled[i]->closure);
   release(&c->rope_cos);
   release(&c->rope_sin);
-  weights_free(c->ws);
+  mlx_map_string_to_array_free(c->weights);
   free(c);
 }
 
 int codec_sample_rate(const Codec *c) { return SAMPLE_RATE; }
 int codec_frame_length(const Codec *c) { return c->frame_length; }
 
-/* ---- layers ---- */
+/* ---- layers ----
+ * Each takes its weights explicitly; snake, residual units and ConvNeXt blocks run
+ * as compiled closures, so the elementwise work between convolutions is fused
+ * (with the same per-op roundings). */
 
-static mlx_array snake(Codec *c, mlx_array x, const char *prefix) {
-  mlx_array alpha = W(c, "%s.alpha", prefix);
-  mlx_array inv = m_reciprocal(m_add(alpha, m_scalar(1e-9f, c->dtype)));
+static mlx_array snake_w(mlx_array x, mlx_array alpha) {
+  mlx_array inv = m_reciprocal(m_add(alpha, m_scalar(1e-9f, m_dtype(alpha))));
   mlx_array s = m_sin(m_mul(alpha, x));
   return m_add(x, m_mul(inv, m_square(s)));
 }
 
 /* CausalConvNet: left pad (k_eff - stride), right pad to whole frames. */
-static mlx_array causal_conv(Codec *c, mlx_array x, const char *prefix, int stride,
-                             int dilation, int groups) {
-  mlx_array w = W(c, "%s.weight", prefix);
-  mlx_array b = W(c, "%s.bias", prefix);
+static mlx_array causal_conv_w(mlx_array x, mlx_array w, mlx_array b, int stride, int dilation,
+                               int groups) {
   int k = m_dim(w, 1);
   int k_eff = (k - 1) * dilation + 1;
   int padding = k_eff - stride;
@@ -95,6 +133,59 @@ static mlx_array causal_conv(Codec *c, mlx_array x, const char *prefix, int stri
   int extra = ideal - length;
   if (padding > 0 || extra > 0) x = m_pad(m_pad(x, 1, padding, 0, 0.0f), 1, 0, extra, 0.0f);
   return m_add(m_conv1d(x, w, stride, 0, dilation, groups), b);
+}
+
+/* in: x, alpha  out: snake(x) */
+static void snake_fn(const mlx_array *in, mlx_array *out, const void *ctx) {
+  (void)ctx;
+  out[0] = snake_w(in[0], in[1]);
+}
+
+/* in: x, alpha1, conv1 w / b, alpha2, conv2 w / b  out: the residual unit */
+static void unit_fn(const mlx_array *in, mlx_array *out, const void *ctx) {
+  const UnitCtx *u = ctx;
+  mlx_array x = in[0];
+  mlx_array y = causal_conv_w(snake_w(x, in[1]), in[2], in[3], 1, u->dilation, 1);
+  y = causal_conv_w(snake_w(y, in[4]), in[5], in[6], 1, 1, 1);
+  int pad = m_dim(x, 1) - m_dim(y, 1);
+  if (pad > 0) x = m_slice_axis(x, 1, 0, m_dim(x, 1) - pad);
+  out[0] = m_add(x, y);
+}
+
+/* in: x, dwconv w / b, norm w / b, pwconv1 w / b, pwconv2 w / b, gamma */
+static void convnext_fn(const mlx_array *in, mlx_array *out, const void *ctx) {
+  (void)ctx;
+  mlx_array x = in[0];
+  int dim = m_dim(x, 2);
+  mlx_array y = causal_conv_w(x, in[1], in[2], 1, 1, dim);
+  y = m_layer_norm(y, in[3], in[4], 1e-6f);
+  y = m_gelu(m_add(m_linear(y, in[5]), in[6]));
+  y = m_add(m_linear(y, in[7]), in[8]);
+  out[0] = m_add(x, m_mul(in[9], y));
+}
+
+static void ensure_compiled(Codec *c) {
+  if (c->compiled.snake.fn) return;
+  static const int dil[3] = {1, 3, 9};
+  c->compiled.snake = (Compiled){.fn = snake_fn, .n_out = 1};
+  c->compiled.convnext = (Compiled){.fn = convnext_fn, .n_out = 1};
+  for (int i = 0; i < 3; i++) {
+    c->compiled.unit_ctx[i].dilation = dil[i];
+    c->compiled.unit[i] = (Compiled){.fn = unit_fn, .ctx = &c->compiled.unit_ctx[i], .n_out = 1};
+  }
+}
+
+static mlx_array snake(Codec *c, mlx_array x, const char *prefix) {
+  ensure_compiled(c);
+  mlx_array in[2] = {x, W(c, "%s.alpha", prefix)}, out;
+  compiled_call(&c->compiled.snake, in, 2, &out);
+  return out;
+}
+
+static mlx_array causal_conv(Codec *c, mlx_array x, const char *prefix, int stride,
+                             int dilation, int groups) {
+  return causal_conv_w(x, W(c, "%s.weight", prefix), W(c, "%s.bias", prefix), stride, dilation,
+                       groups);
 }
 
 /* CausalTransConvNet: transposed conv, then drop (kernel - stride) trailing samples. */
@@ -109,18 +200,19 @@ static mlx_array causal_trans_conv(Codec *c, mlx_array x, const char *prefix, in
 }
 
 static mlx_array residual_unit(Codec *c, mlx_array x, const char *prefix, int dilation) {
-  char p[256];
-  snprintf(p, sizeof(p), "%s.block.0", prefix);
-  mlx_array y = snake(c, x, p);
-  snprintf(p, sizeof(p), "%s.block.1.conv", prefix);
-  y = causal_conv(c, y, p, 1, dilation, 1);
-  snprintf(p, sizeof(p), "%s.block.2", prefix);
-  y = snake(c, y, p);
-  snprintf(p, sizeof(p), "%s.block.3.conv", prefix);
-  y = causal_conv(c, y, p, 1, 1, 1);
-  int pad = m_dim(x, 1) - m_dim(y, 1);
-  if (pad > 0) x = m_slice_axis(x, 1, 0, m_dim(x, 1) - pad);
-  return m_add(x, y);
+  ensure_compiled(c);
+  int which = dilation == 1 ? 0 : dilation == 3 ? 1 : dilation == 9 ? 2 : -1;
+  if (which < 0) die("codec: unexpected dilation %d", dilation);
+  mlx_array in[7] = {x,
+                     W(c, "%s.block.0.alpha", prefix),
+                     W(c, "%s.block.1.conv.weight", prefix),
+                     W(c, "%s.block.1.conv.bias", prefix),
+                     W(c, "%s.block.2.alpha", prefix),
+                     W(c, "%s.block.3.conv.weight", prefix),
+                     W(c, "%s.block.3.conv.bias", prefix)};
+  mlx_array out;
+  compiled_call(&c->compiled.unit[which], in, 7, &out);
+  return out;
 }
 
 static mlx_array linear_bias(Codec *c, mlx_array x, const char *prefix) {
@@ -128,17 +220,20 @@ static mlx_array linear_bias(Codec *c, mlx_array x, const char *prefix) {
 }
 
 static mlx_array convnext(Codec *c, mlx_array x, const char *prefix) {
-  char p[256];
-  int dim = m_dim(x, 2);
-  snprintf(p, sizeof(p), "%s.dwconv.conv", prefix);
-  mlx_array y = causal_conv(c, x, p, 1, 1, dim);
-  y = m_layer_norm(y, W(c, "%s.norm.weight", prefix), W(c, "%s.norm.bias", prefix), 1e-6f);
-  snprintf(p, sizeof(p), "%s.pwconv1", prefix);
-  y = m_gelu(linear_bias(c, y, p));
-  snprintf(p, sizeof(p), "%s.pwconv2", prefix);
-  y = linear_bias(c, y, p);
-  y = m_mul(W(c, "%s.gamma", prefix), y);
-  return m_add(x, y);
+  ensure_compiled(c);
+  mlx_array in[10] = {x,
+                      W(c, "%s.dwconv.conv.weight", prefix),
+                      W(c, "%s.dwconv.conv.bias", prefix),
+                      W(c, "%s.norm.weight", prefix),
+                      W(c, "%s.norm.bias", prefix),
+                      W(c, "%s.pwconv1.weight", prefix),
+                      W(c, "%s.pwconv1.bias", prefix),
+                      W(c, "%s.pwconv2.weight", prefix),
+                      W(c, "%s.pwconv2.bias", prefix),
+                      W(c, "%s.gamma", prefix)};
+  mlx_array out;
+  compiled_call(&c->compiled.convnext, in, 10, &out);
+  return out;
 }
 
 /* ---- window-limited causal transformer ---- */

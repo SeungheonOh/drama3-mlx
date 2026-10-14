@@ -271,7 +271,7 @@ API void d3_tower_decode(void *mp, const float *logits, const float *hidden, int
   SamplingParams p = {temperature, top_p, top_k};
   mlx_array r = tower_decode_step(m, m_astype(l, MLX_BFLOAT16), h, pos,
                                   m_from_data(frame, SH(1, W), MLX_INT32),
-                                  m_from_data(history, SH(n_history), MLX_INT32), &p);
+                                  m_from_data(history, SH(n_history), MLX_INT32), &p, NULL);
   eval_caches(m, r);
   size_t n;
   int32_t *v = m_to_int32(r, &n);

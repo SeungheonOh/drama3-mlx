@@ -4,6 +4,7 @@
 
 # build and run artifacts
 /build/
+/build-*/
 /out/
 /logs/
 /.venv/

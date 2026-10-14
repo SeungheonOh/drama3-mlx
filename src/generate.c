@@ -17,7 +17,7 @@ mlx_array prefill_rows(Model *m, const int32_t *frames, int R, int W, float *all
     size_t mark = arena_mark();
     int end = start + DRAMA3_PREFILL_CHUNK_SIZE < R ? start + DRAMA3_PREFILL_CHUNK_SIZE : R;
     mlx_array chunk = rows_array(frames + (size_t)start * W, end - start, W);
-    mlx_array h = backbone_forward(m, backbone_embed_frames(m, chunk), start);
+    mlx_array h = backbone_forward_frames(m, chunk, start);
     h = m_squeeze(h, 0); /* [T, H] */
     /* The tower cache of row p is labelled with frame p + 1; the last prompt row
      * has no label yet, so the first decode step writes that slot. */
@@ -31,7 +31,9 @@ mlx_array prefill_rows(Model *m, const int32_t *frames, int R, int W, float *all
     size_t n = model_cache_arrays(m, cache_arrays, sizeof(cache_arrays) / sizeof(mlx_array));
     cache_arrays[n++] = last;
     cache_arrays[n++] = h;
-    m_eval_many(cache_arrays, n);
+    /* queue the chunk and build the next one while the GPU runs it */
+    if (all_hidden) m_eval_many(cache_arrays, n);
+    else m_async_eval_many(cache_arrays, n);
     if (all_hidden) {
       size_t count;
       float *v = m_to_float(h, &count);
@@ -56,60 +58,101 @@ Codes generate_frames(Model *m, const Rows *prompt, int max_new_tokens,
   memcpy(frames, prompt->data, (size_t)R * W * sizeof(int32_t));
 
   double t0 = now_seconds();
-  mlx_array cache_arrays[4 * MAX_LAYERS + 4 * MAX_CODEBOOKS + 4];
   mlx_array hidden = prefill_rows(m, frames, R, W, NULL);
   if (verbose) log_info("prefill: %d rows in %.2fs", R, now_seconds() - t0);
 
-  /* main tokens of the last RAS_WINDOW_FRAMES rows */
+  /* Main tokens of the last RAS_WINDOW_FRAMES rows; kept on the device so a step
+   * can be queued before the previous one has been read back. */
   int hist_len = R < RAS_WINDOW_FRAMES ? R : RAS_WINDOW_FRAMES;
-  int32_t history[RAS_WINDOW_FRAMES];
-  for (int i = 0; i < hist_len; i++) history[i] = frames[(size_t)(R - hist_len + i) * W];
+  mlx_array hist = null_array(), frame = null_array();
+  {
+    int32_t history[RAS_WINDOW_FRAMES];
+    for (int i = 0; i < hist_len; i++) history[i] = frames[(size_t)(R - hist_len + i) * W];
+    size_t mark = arena_mark();
+    assign(&hist, m_from_int32(history, hist_len));
+    assign(&frame, rows_array(frames + (size_t)(R - 1) * W, 1, W));
+    arena_release(mark);
+  }
 
+  /* Pipelined decode: step t+1's graph is built and queued while the GPU still
+   * runs step t; step t's frame is read back afterwards. A step queued after the
+   * eos frame is discarded. The random draws happen in the same order as an
+   * unpipelined loop, so a seed gives the same frames. */
   int produced = 0;
   *reason = FINISH_LENGTH;
   double t1 = now_seconds();
-  for (int step = 0; step < max_new_tokens; step++) {
-    size_t mark = arena_mark();
-    int position = R - 1 + step;
-    mlx_array logits = backbone_audio_logits(m, hidden);
-    mlx_array finite = m_all(m_isfinite(logits));
-    mlx_array frame = rows_array(frames + (size_t)position * W, 1, W);
-    mlx_array hist = m_from_int32(history, hist_len);
-    mlx_array sampled = tower_decode_step(m, logits, hidden, position, frame, hist, sampling);
-    mlx_array next_hidden = null_array();
-    if (step + 1 < max_new_tokens) {
-      mlx_array h = backbone_forward(m, backbone_embed_frames(m, sampled), position + 1);
-      next_hidden = m_reshape(h, SH(1, c->hidden));
-    }
-    size_t n = model_cache_arrays(m, cache_arrays, sizeof(cache_arrays) / sizeof(mlx_array));
-    cache_arrays[n++] = sampled;
-    cache_arrays[n++] = finite;
-    if (!is_null(next_hidden)) cache_arrays[n++] = next_hidden;
-    m_eval_many(cache_arrays, n);
-    if (!m_item_int(finite)) die("non-finite logits; refusing to sample invalid audio");
-    size_t count;
-    int32_t *row = m_to_int32(sampled, &count);
-    int main_tok = row[0];
-    if (main_tok == c->eos_id) {
-      free(row);
-      *reason = FINISH_EOS;
+  mlx_array pending = null_array(), pending_finite = null_array();
+  bool done = false;
+  for (int step = 0; step <= max_new_tokens && !done; step++) {
+    mlx_array queued = null_array(), queued_finite = null_array();
+    if (step < max_new_tokens) {
+      size_t mark = arena_mark();
+      int position = R - 1 + step;
+      mlx_array logits = backbone_audio_logits(m, hidden);
+      mlx_array finite = m_all(m_isfinite(logits));
+      mlx_array prefix;
+      mlx_array sampled =
+          tower_decode_step(m, logits, hidden, position, frame, hist, sampling, &prefix);
+      mlx_array main_tok = m_reshape(m_slice_axis(sampled, 1, 0, 1), SH(1));
+      mlx_array next_hist = hist_len == RAS_WINDOW_FRAMES
+                                ? m_concat2(m_slice_axis(hist, 0, 1, RAS_WINDOW_FRAMES), main_tok, 0)
+                                : m_concat2(hist, main_tok, 0);
+      if (hist_len < RAS_WINDOW_FRAMES) hist_len++;
+      /* Evaluation order: the frame's leading codes (all the next backbone step
+       * reads), the rest of the tower, then the next backbone step, so the frame
+       * can be read back before the backbone step finishes. */
+      mlx_array caches[4 * MAX_LAYERS + 4 * MAX_CODEBOOKS];
+      size_t n_caches = model_cache_arrays(m, caches, sizeof(caches) / sizeof(caches[0]));
+      size_t n_backbone = 2 * (size_t)c->n_layers;
+      mlx_array outs[4 * MAX_LAYERS + 4 * MAX_CODEBOOKS + 8];
+      size_t n = 0;
+      outs[n++] = prefix;
+      outs[n++] = sampled;
+      outs[n++] = next_hist;
+      for (size_t i = n_backbone; i < n_caches; i++) outs[n++] = caches[i];
+      outs[n++] = finite;
+      if (step + 1 < max_new_tokens) {
+        mlx_array h = backbone_forward_frames(m, prefix, position + 1);
+        assign(&hidden, m_reshape(h, SH(1, c->hidden)));
+        n_caches = model_cache_arrays(m, caches, sizeof(caches) / sizeof(caches[0]));
+      }
+      for (size_t i = 0; i < n_backbone; i++) outs[n++] = caches[i];
+      if (step + 1 < max_new_tokens) outs[n++] = hidden;
+      m_async_eval_many(outs, n);
+      queued = own(sampled);
+      queued_finite = own(finite);
+      assign(&frame, sampled);
+      assign(&hist, next_hist);
       arena_release(mark);
-      break;
     }
-    memcpy(frames + (size_t)(position + 1) * W, row, W * sizeof(int32_t));
-    free(row);
-    produced++;
-    if (hist_len == RAS_WINDOW_FRAMES) {
-      memmove(history, history + 1, (RAS_WINDOW_FRAMES - 1) * sizeof(int32_t));
-      history[RAS_WINDOW_FRAMES - 1] = main_tok;
-    } else {
-      history[hist_len++] = main_tok;
+    if (!is_null(pending)) {
+      int position = R - 1 + step - 1;
+      if (!m_item_int(pending_finite)) die("non-finite logits; refusing to sample invalid audio");
+      size_t count;
+      int32_t *row = m_to_int32(pending, &count);
+      if (row[0] == c->eos_id) {
+        *reason = FINISH_EOS;
+        done = true;
+      } else {
+        memcpy(frames + (size_t)(position + 1) * W, row, W * sizeof(int32_t));
+        produced++;
+        if (verbose && (produced % 50 == 0))
+          log_info("  %d frames (%.1f frames/s)", produced, produced / (now_seconds() - t1));
+      }
+      free(row);
+      release(&pending);
+      release(&pending_finite);
     }
-    if (!is_null(next_hidden)) assign(&hidden, next_hidden);
-    arena_release(mark);
-    if (verbose && (produced % 50 == 0))
-      log_info("  %d frames (%.1f frames/s)", produced, produced / (now_seconds() - t1));
+    pending = queued;
+    pending_finite = queued_finite;
   }
+  release(&pending);
+  release(&pending_finite);
+  release(&frame);
+  release(&hist);
+  /* the step queued after eos may still be running; let it finish before the
+   * caches are reused */
+  mlx_synchronize(g_stream);
   if (verbose && produced)
     log_info("decode: %d frames in %.2fs (%.2f frames/s), finish=%s", produced,
              now_seconds() - t1, produced / (now_seconds() - t1),

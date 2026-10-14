@@ -24,6 +24,7 @@ set(CORE_SOURCES
   src/resample.c
   src/weights.c
   src/backbone.c
+  src/attention.c
   src/tower.c
   src/sampling.c
   src/prompt.c
@@ -46,3 +47,6 @@ target_link_libraries(drama3 PRIVATE ${MLXC_LIBRARY} m)
 
 add_executable(drama3-tts src/main.c)
 target_link_libraries(drama3-tts PRIVATE drama3_core)
+
+add_executable(drama3-bench tools/bench.c)
+target_link_libraries(drama3-bench PRIVATE drama3_core)
